@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>PhishGuard</title>
+  <style>
+    body { font-family: Arial; padding: 10px; width: 300px; }
+    input, textarea { width: 100%; margin-top: 5px; }
+    button { margin-top: 5px; width: 100%; }
+    #result { margin-top: 10px; white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+
+  <h2>PhishGuard</h2>
+
+  <input id="url" placeholder="Paste URL" />
+  <button id="scanUrl">Scan URL</button>
+
+  <textarea id="email" placeholder="Paste email"></textarea>
+  <button id="scanEmail">Analyze Email</button>
+
+  <div id="result"></div>
+
+  <script src="popup.js"></script>
+
+</body>
+</html>
