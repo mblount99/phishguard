@@ -1,9 +1,21 @@
-
 import OpenAI from "openai";
 
-const client = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY, // keep your key here for now
-});
+let openai = null;
+
+function getOpenAI() {
+  if (!process.env.OPENAI_API_KEY) {
+    console.warn("⚠️ No OpenAI API key found");
+    return null;
+  }
+
+  if (!openai) {
+    openai = new OpenAI({
+      apiKey: process.env.OPENAI_API_KEY
+    });
+  }
+
+  return openai;
+}
 
 export const analyzeWithAI = async (emailText) => {
   try {
