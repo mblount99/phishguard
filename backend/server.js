@@ -8,7 +8,14 @@ import routes from "./routes.js";
 const app = express();
 
 app.use(cors());
-app.use(express.json());
+app.use((req, res, next) => {
+  if (req.originalUrl === "/api/webhook") {
+    next(); // skip JSON parsing for Stripe
+  } else {
+    express.json()(req, res, next);
+  }
+});
+
 
 app.use("/api", routes);
 

@@ -1,3 +1,5 @@
+export const paidUsers = new Set();
+
 const usageMap = {};
 
 const trackUsage = (ip) => {
@@ -109,8 +111,9 @@ export const scanUrl = async (req, res) => {
 
   const userIp = req.ip;
   const usage = trackUsage(userIp);
+  const isPaid = paidUsers.has(userIp);
 
-  if (usage > 20) {
+  if (usage > 20 && !isPaid) {
     return res.json({
       risk_score: 0,
       verdict: "Upgrade Required",
