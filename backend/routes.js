@@ -5,7 +5,20 @@ import { scanUrl, analyzeEmail, paidUsers } from "./services/riskEngine.js";
 
 const router = express.Router();
 
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+let stripe = null;
+
+function getStripe() {
+  if (!process.env.STRIPE_SECRET_KEY) {
+    console.error("❌ Missing STRIPE_SECRET_KEY");
+    return null;
+  }
+
+  if (!stripe) {
+    stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+  }
+
+  return stripe;
+}
 
 // ==============================
 // 🔍 SCAN ROUTES
