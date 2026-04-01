@@ -1,7 +1,8 @@
 import express from "express";
 import Stripe from "stripe";
 
-import { scanUrl, analyzeEmail, paidUsers } from "./services/riskEngine.js";
+import { scanUrl, analyzeEmail } from "./services/riskEngine.js";
+import { paidUsers } from "./store.js";
 
 const router = express.Router();
 

@@ -1,4 +1,16 @@
-export const paidUsers = new Set();
+import { analyzeWithAI } from "./aiAnalyzer.js";
+import { getDomainAge } from "./domainCheck.js";
+import { checkGoogleSafeBrowsing } from "./safeBrowsing.js";
+
+// ==============================
+// 🔐 PREMIUM USERS
+// ==============================
+
+import { paidUsers } from "../store.js";
+
+// ==============================
+// 📊 USAGE TRACKING
+// ==============================
 
 const usageMap = {};
 
@@ -20,100 +32,70 @@ const trackUsage = (ip) => {
   }
 
   usageMap[ip].count++;
+
   return usageMap[ip].count;
 };
 
-import { analyzeWithAI } from "./aiAnalyzer.js";
-import { getDomainAge } from "./domainCheck.js";
-import { checkGoogleSafeBrowsing } from "./safeBrowsing.js";
+// ==============================
+// 🧠 HELPERS
+// ==============================
 
-// 🔍 Levenshtein Distance
-function levenshtein(a, b) {
-  const matrix = [];
+// Simple similarity (typosquatting)
+function isSimilar(a, b) {
+  if (!a || !b) return false;
 
-  for (let i = 0; i <= b.length; i++) matrix[i] = [i];
-  for (let j = 0; j <= a.length; j++) matrix[0][j] = j;
+  let mismatches = 0;
+  const len = Math.min(a.length, b.length);
 
-  for (let i = 1; i <= b.length; i++) {
-    for (let j = 1; j <= a.length; j++) {
-      if (b.charAt(i - 1) === a.charAt(j - 1)) {
-        matrix[i][j] = matrix[i - 1][j - 1];
-      } else {
-        matrix[i][j] = Math.min(
-          matrix[i - 1][j - 1] + 1,
-          matrix[i][j - 1] + 1,
-          matrix[i - 1][j] + 1
-        );
-      }
-    }
+  for (let i = 0; i < len; i++) {
+    if (a[i] !== b[i]) mismatches++;
   }
 
-  return matrix[b.length][a.length];
+  return mismatches <= 2;
 }
 
-// 🔤 Normalize phishing tricks
-function normalizeDomain(str) {
-  return str
-    .replace(/1/g, "l")
-    .replace(/0/g, "o")
-    .replace(/5/g, "s")
-    .replace(/@/g, "a")
-    .replace(/\$/g, "s");
-}
+// Entropy (random-looking domains)
+function getEntropy(str) {
+  const map = {};
+  for (let char of str) {
+    map[char] = (map[char] || 0) + 1;
+  }
 
-// 🌍 Extract TLD
-function getTLD(hostname) {
-  const parts = hostname.split(".");
-  return parts[parts.length - 1];
-}
+  let entropy = 0;
+  const len = str.length;
 
-// 🧠 Extract root domain
-function getDomainName(hostname) {
-  return hostname.split(".")[0];
+  for (let key in map) {
+    const p = map[key] / len;
+    entropy -= p * Math.log2(p);
+  }
+
+  return entropy;
 }
 
 // ==============================
-// 🚀 MAIN FUNCTION
+// 🌐 URL SCAN
 // ==============================
+
 export const scanUrl = async (req, res) => {
   const { url } = req.body;
+  const userIp = req.ip;
 
   if (!url) {
-    return res.status(400).json({ error: "URL required" });
+    return res.status(400).json({
+      risk_score: 0,
+      verdict: "Error",
+      reasons: ["URL required"]
+    });
   }
 
-  const hostname = new URL(url).hostname.replace("www.", "");
-  const domainName = getDomainName(hostname);
-  const normalizedDomain = normalizeDomain(domainName);
+  // ==============================
+  // USAGE LIMIT
+  // ==============================
 
-  console.log("DEBUG:", {
-    hostname,
-    domainName,
-    normalizedDomain
-  });
-
-  const lowerUrl = url.toLowerCase();
-
-  const brands = ["paypal", "chase", "bankofamerica", "apple", "amazon", "microsoft"];
-
-  // 🔥 EARLY OVERRIDE (THIS FIXES YOUR ISSUE)
-  for (const brand of brands) {
-    if (normalizedDomain === brand && domainName !== brand) {
-      return res.json({
-        url,
-        risk_score: 95,
-        verdict: "Dangerous",
-        reasons: [`Exact brand mimic via character substitution (${brand})`],
-        domain_age_days: null
-      });
-    }
-  }
-
-  const userIp = req.ip;
   const usage = trackUsage(userIp);
   const isPaid = paidUsers.has(userIp);
 
-  if (usage > 20 && !isPaid) {
+  if (!isPaid && usage > 20) {
     return res.json({
       risk_score: 0,
       verdict: "Upgrade Required",
@@ -121,125 +103,164 @@ export const scanUrl = async (req, res) => {
     });
   }
 
+  // ==============================
+  // INIT
+  // ==============================
+
   let score = 0;
-  let reasons = [];
+  const reasons = [];
+  const lowerUrl = url.toLowerCase();
 
-  // 🚨 Safe Browsing
-  const isMalicious = await checkGoogleSafeBrowsing(url);
-  if (isMalicious) {
-    return res.json({
-      url,
-      risk_score: 100,
-      verdict: "Dangerous",
-      reasons: ["Listed in Google Safe Browsing"],
-      domain_age_days: null
-    });
-  }
+  // ==============================
+  // BASIC CHECKS
+  // ==============================
 
-  // 🔍 Basic rules
   if (url.includes("@")) {
     score += 40;
     reasons.push("Contains @ symbol (URL masking)");
   }
 
-  const phishingWords = ["login", "secure", "verify", "account", "update", "alert"];
-  const keywordMatches = phishingWords.filter(word => lowerUrl.includes(word));
-
-  if (keywordMatches.length >= 2) {
-    score += 35;
-    reasons.push("Multiple phishing keywords");
-  } else if (keywordMatches.length === 1) {
-    score += 15;
-    reasons.push("Phishing-related keyword");
-  }
-
   if (!url.startsWith("https")) {
-    score += 20;
+    score += 25;
     reasons.push("No HTTPS (insecure)");
   }
 
-  // 🏦 Brand detection (FIXED)
+  if (lowerUrl.match(/login|secure|verify|account|update|bank|paypal|password/i)) {
+    score += 20;
+    reasons.push("Phishing-related keywords");
+  }
+
+  if (url.length > 100) {
+    score += 15;
+    reasons.push("Unusually long URL");
+  }
+
+  // ==============================
+  // DOMAIN PARSING
+  // ==============================
+
+  let hostname = "";
+  let domainName = "";
+  let tld = "";
+
+  try {
+    hostname = new URL(url).hostname.replace("www.", "");
+    const parts = hostname.split(".");
+    domainName = parts[0];
+    tld = parts[parts.length - 1];
+  } catch {
+    score += 50;
+    reasons.push("Invalid URL format");
+  }
+
+  const normalizedDomain = domainName
+    .replace(/1/g, "l")
+    .replace(/0/g, "o");
+
+  console.log("DEBUG:", { hostname, domainName, normalizedDomain });
+
+  // ==============================
+  // 🔴 SUSPICIOUS TLD
+  // ==============================
+
+  const riskyTlds = ["xyz", "top", "click", "gq", "tk", "ml"];
+
+  if (riskyTlds.includes(tld)) {
+    score += 30;
+    reasons.push(`Suspicious TLD (.${tld})`);
+  }
+
+  // ==============================
+  // 🔴 BRAND SPOOFING
+  // ==============================
+
+  const brands = ["paypal", "chase", "bank", "amazon", "apple"];
+
   for (const brand of brands) {
-    if (normalizedDomain.includes(brand) && domainName !== brand) {
+    if (
+      (normalizedDomain.includes(brand) && domainName !== brand) ||
+      isSimilar(normalizedDomain, brand)
+    ) {
       score += 50;
-      reasons.push(`Fake ${brand} domain`);
+      reasons.push(`Possible spoofing of ${brand}`);
       break;
     }
   }
 
-  // 🔍 Similarity
-  const legitDomains = [
-    "paypal.com",
-    "chase.com",
-    "bankofamerica.com",
-    "apple.com",
-    "amazon.com",
-    "microsoft.com"
-  ];
+  // ==============================
+  // 🔴 ENTROPY CHECK
+  // ==============================
 
-  for (const legit of legitDomains) {
-    const legitName = legit.split(".")[0];
-    const distance = levenshtein(domainName, legitName);
+  const entropy = getEntropy(domainName);
 
-    if (distance > 0 && distance <= 2) {
-      score += 60;
-      reasons.push(`Domain mimics ${legit}`);
-      break;
-    }
+  if (entropy > 3.5) {
+    score += 20;
+    reasons.push("Random-looking domain");
   }
 
-  // 🔤 Character substitution
-  for (const brand of brands) {
-    if (normalizedDomain.includes(brand) && !domainName.includes(brand)) {
-      score += 60;
-      reasons.push(`Character substitution attack (${brand})`);
-      break;
-    }
+  // ==============================
+  // 🌐 DOMAIN AGE
+  // ==============================
+
+  let age = null;
+
+  try {
+    age = await getDomainAge(url);
+  } catch {
+    console.warn("⚠️ Domain age lookup failed");
   }
 
-  // 🌐 Domain age
-  const age = await getDomainAge(url);
-
-  if (age !== null && age < 7) {
+  if (age === null) {
+    score += 10;
+    reasons.push("Domain age unknown");
+  } else if (age < 7) {
     score += 40;
     reasons.push("Very new domain");
-  } else if (age !== null && age < 30) {
+  } else if (age < 30) {
     score += 25;
     reasons.push("New domain");
   }
 
-  // 🌍 TLD risk
-  const riskyTLDs = ["xyz", "ru", "tk", "ml", "ga", "cf", "gq", "top", "work"];
-  const tld = getTLD(hostname);
+  // ==============================
+  // 🛑 GOOGLE SAFE BROWSING
+  // ==============================
 
-  if (riskyTLDs.includes(tld)) {
-    score += 25;
-    reasons.push(`High-risk TLD (.${tld})`);
+  try {
+    const isMalicious = await checkGoogleSafeBrowsing(url);
+
+    if (isMalicious) {
+      score += 80;
+      reasons.push("Flagged by Google Safe Browsing");
+    }
+  } catch {
+    console.warn("⚠️ Safe Browsing failed");
   }
 
-  // 🔥 Combo boost
-  if (reasons.length >= 3 && score >= 60) {
-    score += 15;
-    reasons.push("Multiple high-risk indicators");
-  }
+  // ==============================
+  // FINAL
+  // ==============================
 
-  // 🎯 Final
   score = Math.min(score, 100);
 
   let verdict = "Safe";
-  if (score >= 80) verdict = "Dangerous";
-  else if (score >= 50) verdict = "Suspicious";
 
-  res.json({
+  if (score >= 70) verdict = "Dangerous";
+  else if (score >= 40) verdict = "Suspicious";
+
+  return res.json({
     url,
     risk_score: score,
     verdict,
     reasons,
     domain_age_days: age,
+    entropy
   });
 };
 
-// 📧 Email analysis
+// ==============================
+// 📧 EMAIL ANALYSIS
+// ==============================
+
 export const analyzeEmail = async (req, res) => {
   const { emailText } = req.body;
 
@@ -254,7 +275,6 @@ export const analyzeEmail = async (req, res) => {
   try {
     const result = await analyzeWithAI(emailText);
 
-    // 🔥 FORCE STRUCTURE
     return res.json({
       risk_score: Number(result?.risk_score) || 75,
       verdict: result?.verdict || "Suspicious",
