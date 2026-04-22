@@ -50,25 +50,16 @@ function levenshtein(a, b) {
   return matrix[b.length][a.length];
 }
 
-function getEntropy(str) {
-  const map = {};
-  for (let c of str) map[c] = (map[c] || 0) + 1;
-
-  let entropy = 0;
-  for (let k in map) {
-    const p = map[k] / str.length;
-    entropy -= p * Math.log2(p);
-  }
-
-  return entropy;
-}
+// ==============================
+// 🌐 ELITE URL SCAN
+// ==============================
 
 // ==============================
-// 🌐 URL SCAN
+// 🌐 ELITE URL SCAN
 // ==============================
 
 export const scanUrl = async (req, res) => {
-  const { url } = req.body;
+  let { url } = req.body;
   const userIp = req.ip;
 
   if (!url) {
@@ -77,6 +68,16 @@ export const scanUrl = async (req, res) => {
       verdict: "Error",
       reasons: ["URL required"]
     });
+  }
+
+  // ==============================
+  // URL NORMALIZATION (CRITICAL FIX)
+  // ==============================
+
+  url = url.trim();
+
+  if (!url.startsWith("http://") && !url.startsWith("https://")) {
+    url = "https://" + url;
   }
 
   // ==============================
@@ -95,20 +96,24 @@ export const scanUrl = async (req, res) => {
   }
 
   let score = 0;
+  let confidence = 50;
   const reasons = [];
-  const lowerUrl = url.toLowerCase();
 
   let hostname = "";
-  let domainName = "";
-  let tld = "";
+  let rootDomain = "";
+  let subdomain = "";
+  let path = "";
 
   try {
-    hostname = new URL(url).hostname.replace("www.", "");
+    const parsed = new URL(url);
+    hostname = parsed.hostname.toLowerCase();
+    path = parsed.pathname.toLowerCase();
+
     const parts = hostname.split(".");
-    domainName = parts[0];
-    tld = parts[parts.length - 1];
+    rootDomain = parts.slice(-2).join(".");
+    subdomain = parts.slice(0, -2).join(".");
   } catch {
-    score += 50;
+    score += 60;
     reasons.push("Invalid URL format");
   }
 
@@ -116,73 +121,66 @@ export const scanUrl = async (req, res) => {
   // TRUSTED DOMAINS
   // ==============================
 
-  const trustedDomains = [
+  const trusted = [
+    "google.com",
     "chase.com",
     "paypal.com",
     "amazon.com",
     "apple.com",
-    "google.com"
+    "microsoft.com"
   ];
 
-  const isTrusted = trustedDomains.some((d) =>
-    hostname.endsWith(d)
-  );
+  const isTrusted = trusted.some((d) => rootDomain === d);
 
   // ==============================
-  // BASIC CHECKS
+  // BASIC SIGNALS
   // ==============================
 
   if (url.includes("@")) {
     score += 40;
-    reasons.push("URL contains @ (possible masking)");
+    reasons.push("URL masking with @");
   }
 
   if (!url.startsWith("https")) {
-    score += 15;
-    reasons.push("Not using HTTPS");
+    score += 10;
+    reasons.push("Not HTTPS");
   }
 
   if (url.length > 120) {
     score += 15;
-    reasons.push("Very long URL");
+    reasons.push("Unusually long URL");
   }
 
-  if (lowerUrl.match(/login|verify|secure|account|update|password/)) {
-    score += 15;
-    reasons.push("Sensitive keywords in URL");
-  }
-
-  // ==============================
-  // SUSPICIOUS TLD
-  // ==============================
-
-  const badTlds = ["xyz", "top", "click", "tk", "ml"];
-
-  if (!isTrusted && badTlds.includes(tld)) {
-    score += 25;
-    reasons.push(`Suspicious domain (.${tld})`);
+  if (path.match(/login|verify|secure|account|update|password/)) {
+    score += 20;
+    reasons.push("Sensitive path keywords");
   }
 
   // ==============================
   // SUBDOMAIN ATTACK
   // ==============================
 
-  if (!isTrusted && hostname.split(".").length > 3) {
-    score += 25;
-    reasons.push("Suspicious subdomain structure");
+  const brands = ["paypal", "chase", "amazon", "apple", "bank"];
+
+  if (!isTrusted && subdomain) {
+    for (const brand of brands) {
+      if (subdomain.includes(brand)) {
+        score += 50;
+        reasons.push(`Brand "${brand}" hidden in subdomain`);
+        break;
+      }
+    }
   }
 
   // ==============================
-  // BRAND SPOOFING
+  // DOMAIN SPOOFING
   // ==============================
-
-  const brands = ["paypal", "chase", "amazon", "apple", "bank"];
 
   if (!isTrusted) {
     for (const brand of brands) {
-      const distance = levenshtein(domainName, brand);
+      const dist = levenshtein(rootDomain.split(".")[0], brand);
 
-      if (distance <= 2 && domainName !== brand) {
+      if (dist <= 2 && rootDomain !== `${brand}.com`) {
         score += 45;
         reasons.push(`Domain mimics ${brand}`);
         break;
@@ -191,14 +189,15 @@ export const scanUrl = async (req, res) => {
   }
 
   // ==============================
-  // ENTROPY (RANDOM DOMAINS)
+  // SUSPICIOUS TLD
   // ==============================
 
-  const entropy = getEntropy(domainName);
+  const badTlds = ["xyz", "top", "click", "tk", "ml"];
+  const tld = rootDomain.split(".")[1];
 
-  if (!isTrusted && entropy > 3.5) {
-    score += 20;
-    reasons.push("Random-looking domain");
+  if (!isTrusted && badTlds.includes(tld)) {
+    score += 25;
+    reasons.push(`Suspicious domain (.${tld})`);
   }
 
   // ==============================
@@ -222,15 +221,16 @@ export const scanUrl = async (req, res) => {
   }
 
   // ==============================
-  // SAFE BROWSING
+  // GOOGLE SAFE BROWSING
   // ==============================
 
   try {
     const flagged = await checkGoogleSafeBrowsing(url);
 
     if (flagged) {
-      score += 80;
-      reasons.push("Reported as dangerous");
+      score = 100;
+      confidence = 100;
+      reasons.push("Known phishing/malware site");
     }
   } catch {}
 
@@ -240,6 +240,10 @@ export const scanUrl = async (req, res) => {
 
   score = Math.min(score, 100);
 
+  if (score >= 80) confidence = 95;
+  else if (score >= 60) confidence = 85;
+  else if (score >= 40) confidence = 70;
+
   let verdict = "Safe";
   if (score >= 70) verdict = "Dangerous";
   else if (score >= 40) verdict = "Suspicious";
@@ -248,6 +252,7 @@ export const scanUrl = async (req, res) => {
     url,
     risk_score: score,
     verdict,
+    confidence,
     reasons,
     domain_age_days: age
   });
