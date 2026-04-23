@@ -1,10 +1,11 @@
+import { parse } from "tldts";
 import { analyzeWithAI } from "./aiAnalyzer.js";
 import { getDomainAge } from "./domainCheck.js";
 import { checkGoogleSafeBrowsing } from "./safeBrowsing.js";
 import { paidUsers } from "../store.js";
 
 // ==============================
-// 📊 USAGE TRACKING
+// 📊 USAGE
 // ==============================
 
 const usageMap = {};
@@ -30,7 +31,6 @@ const trackUsage = (ip) => {
 
 function levenshtein(a, b) {
   const matrix = [];
-
   for (let i = 0; i <= b.length; i++) matrix[i] = [i];
   for (let j = 0; j <= a.length; j++) matrix[0][j] = j;
 
@@ -46,20 +46,37 @@ function levenshtein(a, b) {
             );
     }
   }
-
   return matrix[b.length][a.length];
 }
 
-// ==============================
-// 🌐 ELITE URL SCAN
-// ==============================
+function entropy(str) {
+  const map = {};
+  for (let c of str) map[c] = (map[c] || 0) + 1;
+
+  let result = 0;
+  for (let k in map) {
+    const p = map[k] / str.length;
+    result -= p * Math.log2(p);
+  }
+
+  return result;
+}
 
 // ==============================
-// 🌐 ELITE URL SCAN
+// 🌐 SCAN URL
 // ==============================
 
 export const scanUrl = async (req, res) => {
-  let { url } = req.body;
+  let { url, domSignals } = req.body;
+
+  if (typeof url !== "string" || url.length > 2000) {
+    return res.json({
+      risk_score: 0,
+      verdict: "Error",
+      reasons: ["Invalid URL input"]
+    });
+  }
+
   const userIp = req.ip;
 
   if (!url) {
@@ -69,20 +86,6 @@ export const scanUrl = async (req, res) => {
       reasons: ["URL required"]
     });
   }
-
-  // ==============================
-  // URL NORMALIZATION (CRITICAL FIX)
-  // ==============================
-
-  url = url.trim();
-
-  if (!url.startsWith("http://") && !url.startsWith("https://")) {
-    url = "https://" + url;
-  }
-
-  // ==============================
-  // USAGE LIMIT
-  // ==============================
 
   const usage = trackUsage(userIp);
   const isPaid = paidUsers.has(userIp);
@@ -95,9 +98,12 @@ export const scanUrl = async (req, res) => {
     });
   }
 
-  let score = 0;
-  let confidence = 50;
-  const reasons = [];
+  // ==============================
+  // NORMALIZE URL
+  // ==============================
+
+  url = url.trim();
+  if (!url.startsWith("http")) url = "https://" + url;
 
   let hostname = "";
   let rootDomain = "";
@@ -105,21 +111,32 @@ export const scanUrl = async (req, res) => {
   let path = "";
 
   try {
-    const parsed = new URL(url);
-    hostname = parsed.hostname.toLowerCase();
-    path = parsed.pathname.toLowerCase();
+    const parsedUrl = new URL(url);
+    path = parsedUrl.pathname.toLowerCase();
 
-    const parts = hostname.split(".");
-    rootDomain = parts.slice(-2).join(".");
-    subdomain = parts.slice(0, -2).join(".");
+    const parsed = parse(url);
+    hostname = parsed.hostname || "";
+    rootDomain = parsed.domain || "";
+    subdomain = parsed.subdomain || "";
   } catch {
-    score += 60;
-    reasons.push("Invalid URL format");
+    return res.json({
+      risk_score: 85,
+      verdict: "Dangerous",
+      reasons: ["Malformed URL"]
+    });
   }
 
-  // ==============================
-  // TRUSTED DOMAINS
-  // ==============================
+  let features = {
+    spoof: 0,
+    subdomain: 0,
+    path: 0,
+    tld: 0,
+    age: 0,
+    dom: 0,
+    http: 0
+  };
+
+  const reasons = [];
 
   const trusted = [
     "google.com",
@@ -130,74 +147,70 @@ export const scanUrl = async (req, res) => {
     "microsoft.com"
   ];
 
-  const isTrusted = trusted.some((d) => rootDomain === d);
+  const isTrusted = trusted.includes(rootDomain);
+
+  // ==============================
+  // HOSTNAME TRICK DETECTION
+  // ==============================
+
+  if (
+    hostname.includes("login") &&
+    !rootDomain.includes("login")
+  ) {
+    features.path += 0.5;
+    reasons.push("Misleading hostname structure (login keyword)");
+  }
+
+  if (
+    hostname.split(".").length > 4 &&
+    !isTrusted
+  ) {
+    features.subdomain += 0.5;
+    reasons.push("Excessive subdomain depth");
+  }
 
   // ==============================
   // BASIC SIGNALS
   // ==============================
 
-  if (url.includes("@")) {
-    score += 40;
-    reasons.push("URL masking with @");
+  if (url.startsWith("http://")) {
+    features.http = 1;
+    reasons.push("Insecure HTTP connection");
   }
 
-  if (!url.startsWith("https")) {
-    score += 10;
-    reasons.push("Not HTTPS");
+  const keywords = ["login", "verify", "secure", "account", "update"];
+  if (keywords.some(k => path.includes(k))) {
+    features.path = 1;
+    reasons.push("Sensitive URL path detected");
   }
 
-  if (url.length > 120) {
-    score += 15;
-    reasons.push("Unusually long URL");
-  }
-
-  if (path.match(/login|verify|secure|account|update|password/)) {
-    score += 20;
-    reasons.push("Sensitive path keywords");
-  }
-
-  // ==============================
-  // SUBDOMAIN ATTACK
-  // ==============================
-
-  const brands = ["paypal", "chase", "amazon", "apple", "bank"];
+  const brands = ["paypal", "chase", "amazon", "apple"];
 
   if (!isTrusted && subdomain) {
-    for (const brand of brands) {
-      if (subdomain.includes(brand)) {
-        score += 50;
-        reasons.push(`Brand "${brand}" hidden in subdomain`);
-        break;
-      }
+    if (brands.some(b => subdomain.includes(b))) {
+      features.subdomain = 1;
+      reasons.push("Brand in subdomain");
     }
   }
-
-  // ==============================
-  // DOMAIN SPOOFING
-  // ==============================
 
   if (!isTrusted) {
-    for (const brand of brands) {
-      const dist = levenshtein(rootDomain.split(".")[0], brand);
+    const name = rootDomain.split(".")[0];
 
-      if (dist <= 2 && rootDomain !== `${brand}.com`) {
-        score += 45;
-        reasons.push(`Domain mimics ${brand}`);
-        break;
-      }
+    if (brands.some(b => levenshtein(name, b) <= 2 && name !== b)) {
+      features.spoof = 1;
+      reasons.push("Domain spoofing detected");
+    }
+
+    if (entropy(name) > 3.5) {
+      features.spoof += 0.5;
+      reasons.push("Random-looking domain");
     }
   }
 
-  // ==============================
-  // SUSPICIOUS TLD
-  // ==============================
-
-  const badTlds = ["xyz", "top", "click", "tk", "ml"];
-  const tld = rootDomain.split(".")[1];
-
-  if (!isTrusted && badTlds.includes(tld)) {
-    score += 25;
-    reasons.push(`Suspicious domain (.${tld})`);
+  const badTlds = ["xyz", "top", "click"];
+  if (!isTrusted && badTlds.includes(rootDomain.split(".")[1])) {
+    features.tld = 1;
+    reasons.push("Suspicious domain extension");
   }
 
   // ==============================
@@ -205,61 +218,93 @@ export const scanUrl = async (req, res) => {
   // ==============================
 
   let age = null;
-
   try {
     age = await getDomainAge(url);
+
+    if (!isTrusted && age !== null && age < 30) {
+      features.age = 1;
+      reasons.push("New domain");
+    }
   } catch {}
 
-  if (!isTrusted) {
-    if (age !== null && age < 7) {
-      score += 35;
-      reasons.push("Very new domain");
-    } else if (age !== null && age < 30) {
-      score += 20;
-      reasons.push("New domain");
+  // ==============================
+  // DOM SIGNALS
+  // ==============================
+
+  if (domSignals) {
+    if (domSignals.hasPassword) {
+      features.dom += 0.5;
+      reasons.push("Password input detected");
+    }
+
+    if (domSignals.externalForm) {
+      features.dom += 0.5;
+      reasons.push("Form submits to external domain");
+    }
+
+    if (domSignals.hasPassword && domSignals.externalForm) {
+      features.dom += 1;
+      reasons.push("Login form submits credentials to external site");
     }
   }
 
   // ==============================
-  // GOOGLE SAFE BROWSING
+  // MODEL SCORING
+  // ==============================
+
+  const score =
+    25 * features.spoof +
+    20 * features.subdomain +
+    15 * features.path +
+    10 * features.tld +
+    10 * features.age +
+    10 * features.dom +
+    10 * features.http;
+
+  let finalScore = Math.min(score, 100);
+
+  // ==============================
+  // SAFE BROWSING
   // ==============================
 
   try {
     const flagged = await checkGoogleSafeBrowsing(url);
 
     if (flagged) {
-      score = 100;
-      confidence = 100;
-      reasons.push("Known phishing/malware site");
+      finalScore = 100;
+      reasons.push("Flagged by Google Safe Browsing");
     }
-  } catch {}
+  } catch (e) {
+    console.error("SafeBrowsing error:", e.message);
+  }
 
   // ==============================
-  // FINAL
+  // ANALYTICS LOG
   // ==============================
 
-  score = Math.min(score, 100);
-
-  if (score >= 80) confidence = 95;
-  else if (score >= 60) confidence = 85;
-  else if (score >= 40) confidence = 70;
+  console.log("SCAN RESULT:", {
+    url,
+    rootDomain,
+    score: finalScore,
+    verdict: finalScore >= 70 ? "Dangerous" : finalScore >= 40 ? "Suspicious" : "Safe",
+    reasons
+  });
 
   let verdict = "Safe";
-  if (score >= 70) verdict = "Dangerous";
-  else if (score >= 40) verdict = "Suspicious";
+  if (finalScore >= 70) verdict = "Dangerous";
+  else if (finalScore >= 40) verdict = "Suspicious";
 
   return res.json({
     url,
-    risk_score: score,
+    risk_score: finalScore,
     verdict,
-    confidence,
     reasons,
     domain_age_days: age
   });
 };
 
 // ==============================
-// 📧 EMAIL ANALYSIS
+// 📧 EMAIL
 // ==============================
 
 export const analyzeEmail = async (req, res) => {
@@ -269,24 +314,17 @@ export const analyzeEmail = async (req, res) => {
     return res.json({
       risk_score: 0,
       verdict: "Error",
-      reasons: ["Email text required"]
+      reasons: ["Email required"]
     });
   }
 
   try {
-    const result = await analyzeWithAI(emailText);
-
-    return res.json({
-      risk_score: Number(result?.risk_score) || 75,
-      verdict: result?.verdict || "Suspicious",
-      reasons: result?.reasons || ["Potential phishing detected"]
-    });
-
-  } catch (err) {
+    return res.json(await analyzeWithAI(emailText));
+  } catch {
     return res.json({
       risk_score: 70,
       verdict: "Suspicious",
-      reasons: ["AI fallback triggered"]
+      reasons: ["AI fallback"]
     });
   }
 };
